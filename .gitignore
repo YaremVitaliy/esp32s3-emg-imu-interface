@@ -1,55 +1,62 @@
-# Prerequisites
-*.d
+# Build directories
+build/
+dist/
 
-# Object files
-*.o
-*.ko
-*.obj
+# ESP-IDF specific
+sdkconfig
+sdkconfig.old
+*.bin
 *.elf
-
-# Linker output
-*.ilk
 *.map
-*.exp
 
-# Precompiled Headers
-*.gch
-*.pch
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 
-# Shared objects (inc. Windows DLLs)
-*.dll
+# Python bytecode (if using Python scripts)
+__pycache__/
+*.py[cod]
+*$py.class
 *.so
-*.so.*
-*.dylib
 
-# Executables
+# C/C++ object files
+*.o
+*.obj
 *.exe
 *.out
 *.app
-*.i*86
-*.x86_64
-*.hex
 
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
+# Dependencies
+node_modules/
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+# Logs
+*.log
+logs/
 
-# debug information files
-*.dwo
+# Temporary files
+*.tmp
+*.temp
+
+# Flash download tool files
+download.config
+
+# Partition table binary
+partition_table.bin
+
+# Application binary
+*.bin
+
+# Bootloader binary
+bootloader.bin
