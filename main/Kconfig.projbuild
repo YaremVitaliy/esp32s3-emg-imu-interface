@@ -10,7 +10,7 @@ menu "HID Example Configuration"
     choice EXAMPLE_HID_DEVICE_ROLE
         prompt "HID Device Role"
         depends on BT_NIMBLE_ENABLED
-        default EXAMPLE_MEDIA_ENABLE
+        default EXAMPLE_MOUSE_ENABLE
         help
             Three Supported Roles for Device
             - Media Device
