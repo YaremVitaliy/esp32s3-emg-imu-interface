@@ -373,6 +373,15 @@ void mouse_logic_task(void *pvParameters)
     // Movement accumulator for smoother movement
     float accumulated_x = 0.0;
     float accumulated_y = 0.0;
+    
+    // Low-pass filter for angle smoothing
+    float filtered_roll = 0.0;
+    float filtered_pitch = 0.0;
+    float filter_alpha = 0.7;  // Filter coefficient (0 = no filtering, 1 = max filtering)
+    
+    // Movement detection
+    uint32_t last_movement_time = 0;
+    const uint32_t movement_timeout_ms = 50;  // Мінімальний час між рухами
 
     while (1)
     {
@@ -404,6 +413,10 @@ void mouse_logic_task(void *pvParameters)
 
         roll = alpha * (roll + gyroX * dt) + (1.0 - alpha) * acc_roll;
         pitch = alpha * (pitch + gyroY * dt) + (1.0 - alpha) * acc_pitch;
+        
+        // Застосовуємо фільтр низьких частот для згладжування
+        filtered_roll = filter_alpha * filtered_roll + (1.0 - filter_alpha) * roll;
+        filtered_pitch = filter_alpha * filtered_pitch + (1.0 - filter_alpha) * pitch;
 
         // 2. Маппінг руху миші (Tilt to Move)
         // Обчислюємо швидкість руху на основі кута нахилу
@@ -411,37 +424,55 @@ void mouse_logic_task(void *pvParameters)
         float mouse_vel_x = 0.0;
         float mouse_vel_y = 0.0;
 
-        float deadzone = 5.0;     // Мертва зона в градусах (зменшено)
-        float sensitivity = 0.3;  // Чутливість руху (зменшено для плавності)
-        float max_velocity = 8.0; // Максимальна швидкість пікселів за кадр
+        float deadzone = 8.0;      // Збільшена мертва зона в градусах
+        float sensitivity = 0.15;  // Зменшена чутливість для більш точного контролю
+        float max_velocity = 6.0;  // Зменшена максимальна швидкість
 
-        // Логіка X (Roll) - обчислюємо швидкість
-        if (fabs(roll) > deadzone) {
-            mouse_vel_x = (roll > 0 ? roll - deadzone : roll + deadzone) * sensitivity;
+        // Логіка X (Roll) - використовуємо фільтровані значення
+        if (fabs(filtered_roll) > deadzone) {
+            float effective_roll = filtered_roll > 0 ? filtered_roll - deadzone : filtered_roll + deadzone;
+            mouse_vel_x = effective_roll * sensitivity;
+        } else {
+            mouse_vel_x = 0.0;  // Явно обнулюємо в мертвій зоні
         }
 
-        // Логіка Y (Pitch) - обчислюємо швидкість  
-        if (fabs(pitch) > deadzone) {
-            mouse_vel_y = (pitch > 0 ? pitch - deadzone : pitch + deadzone) * sensitivity;
+        // Логіка Y (Pitch) - використовуємо фільтровані значення
+        if (fabs(filtered_pitch) > deadzone) {
+            float effective_pitch = filtered_pitch > 0 ? filtered_pitch - deadzone : filtered_pitch + deadzone;
+            mouse_vel_y = effective_pitch * sensitivity;
+        } else {
+            mouse_vel_y = 0.0;  // Явно обнулюємо в мертвій зоні
         }
 
         // Обмежуємо максимальну швидкість
-        if (mouse_vel_x > max_velocity) mouse_vel_x = max_velocity;
-        if (mouse_vel_x < -max_velocity) mouse_vel_x = -max_velocity;
-        if (mouse_vel_y > max_velocity) mouse_vel_y = max_velocity;
-        if (mouse_vel_y < -max_velocity) mouse_vel_y = -max_velocity;
+        mouse_vel_x = fmaxf(-max_velocity, fminf(max_velocity, mouse_vel_x));
+        mouse_vel_y = fmaxf(-max_velocity, fminf(max_velocity, mouse_vel_y));
         
-        // Накопичуємо рух
-        accumulated_x += mouse_vel_x;
-        accumulated_y += mouse_vel_y;
+        // Накопичуємо рух тільки якщо є значний рух
+        float min_velocity_threshold = 0.2;  // Мінімальний поріг швидкості
+        if (fabs(mouse_vel_x) > min_velocity_threshold || fabs(mouse_vel_y) > min_velocity_threshold) {
+            accumulated_x += mouse_vel_x;
+            accumulated_y += mouse_vel_y;
+        } else {
+            // Поступово зменшуємо накопичений рух при відсутності нового руху
+            accumulated_x *= 0.9;
+            accumulated_y *= 0.9;
+            
+            // Обнулюємо дуже малі значення
+            if (fabs(accumulated_x) < 0.1) accumulated_x = 0.0;
+            if (fabs(accumulated_y) < 0.1) accumulated_y = 0.0;
+        }
         
-        // Конвертуємо в цілі пікселі для відправки
-        int8_t mouse_x = (int8_t)accumulated_x;
-        int8_t mouse_y = (int8_t)accumulated_y;
-        
-        // Віднімаємо відправлені пікселі з накопичувача
-        accumulated_x -= mouse_x;
-        accumulated_y -= mouse_y;
+        // Конвертуємо в цілі пікселі для відправки тільки якщо накопичилося достатньо
+        int8_t mouse_x = 0, mouse_y = 0;
+        if (fabs(accumulated_x) >= 1.0) {
+            mouse_x = (int8_t)roundf(accumulated_x);
+            accumulated_x -= mouse_x;
+        }
+        if (fabs(accumulated_y) >= 1.0) {
+            mouse_y = (int8_t)roundf(accumulated_y);
+            accumulated_y -= mouse_y;
+        }
 
         // 3. Читаємо EMG
         int emg_voltage = read_emg_voltage();
@@ -464,19 +495,41 @@ void mouse_logic_task(void *pvParameters)
             buttons |= 0x01; // Біт 0 = Left Click
         }
 
-        // 4. Відправка даних тільки при змінах
+        // 4. Відправка даних тільки при справжніх змінах з контролем часу
         bool button_changed = (left_click_pressed != prev_left_click_pressed);
         bool movement_detected = (mouse_x != 0 || mouse_y != 0);
+        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
         
-        if (movement_detected || button_changed)
-        {
-            if (ble_connected) {
-                send_mouse(buttons, mouse_x, mouse_y, 0);
-                ESP_LOGI(TAG, "Mouse Report - X: %d, Y: %d, Buttons: %02X (Roll: %.1f, Pitch: %.1f)", 
-                         mouse_x, mouse_y, buttons, roll, pitch);
-            } else {
-                ESP_LOGW(TAG, "Not connected - X: %d, Y: %d, Buttons: %02X", mouse_x, mouse_y, buttons);
+        // Відправляємо дані тільки якщо:
+        // 1) Змінилася кнопка (негайно)
+        // 2) Є рух И пройшов мінімальний час з останньої відправки
+        bool should_send = button_changed || 
+                          (movement_detected && (current_time - last_movement_time >= movement_timeout_ms));
+        
+        if (should_send && ble_connected) {
+            send_mouse(buttons, mouse_x, mouse_y, 0);
+            
+            if (movement_detected) {
+                last_movement_time = current_time;
             }
+            
+            // Логування тільки для значущих подій
+            if (movement_detected || button_changed) {
+                ESP_LOGI(TAG, "Mouse Report - X: %d, Y: %d, Buttons: %02X (FRoll: %.1f, FPitch: %.1f)", 
+                         mouse_x, mouse_y, buttons, filtered_roll, filtered_pitch);
+            }
+        } else if (button_changed && !ble_connected) {
+            ESP_LOGW(TAG, "Not connected - Button change detected: %02X", buttons);
+        }
+        
+        // Діагностика тільки при значних змінах кута (рівень DEBUG)
+        static float last_logged_roll = 0;
+        static float last_logged_pitch = 0;
+        if (fabs(filtered_roll - last_logged_roll) > 10.0 || fabs(filtered_pitch - last_logged_pitch) > 10.0) {
+            ESP_LOGD(TAG, "Angle update - FRoll: %.1f, FPitch: %.1f, VelX: %.2f, VelY: %.2f, AccX: %.2f, AccY: %.2f", 
+                     filtered_roll, filtered_pitch, mouse_vel_x, mouse_vel_y, accumulated_x, accumulated_y);
+            last_logged_roll = filtered_roll;
+            last_logged_pitch = filtered_pitch;
         }
         
         // Запам'ятовуємо попередній стан кнопки
@@ -509,20 +562,7 @@ void ble_hid_task_shut_down(void)
         s_ble_hid_param.task_hdl = NULL;
     }
 }
-// void bt_hid_task_start_up(void)
-// {
-//     //xTaskCreate(bt_hid_demo_task, "bt_hid_demo_task", 2 * 1024, NULL, configMAX_PRIORITIES - 3, &s_bt_hid_param.task_hdl);
-//     xTaskCreate(&mouse_logic_task, "mouse_task", 4096, NULL, 5, NULL);
-//     return;
-// }
 
-// void bt_hid_task_shut_down(void)
-// {
-//     if (s_bt_hid_param.task_hdl) {
-//         vTaskDelete(s_bt_hid_param.task_hdl);
-//         s_bt_hid_param.task_hdl = NULL;
-//     }
-// }
 // Callback подій HID (підключення/відключення)
 static void ble_hidd_event_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
 {
