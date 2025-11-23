@@ -1,0 +1,29 @@
+# ESP32-S3 Troubleshooting Commands
+
+# 1. Set up ESP-IDF environment
+cd C:\Users\Vitaliy\esp\v5.4.1\esp-idf
+.\export.ps1
+cd C:\Users\Vitaliy\Documents\esp32s3-emg-imu-interface
+
+# 2. Configure project for ESP32-S3
+idf.py set-target esp32s3
+idf.py clean
+idf.py reconfigure
+
+# 3. Build the project
+idf.py build
+
+# 4. Check for available ports
+idf.py monitor --print-filter=""
+
+# 5. Flash with specific port (replace COMX with actual port)
+idf.py -p COMX flash
+
+# 6. Alternative: Flash with USB JTAG
+idf.py -p esp32s3 flash
+
+# 7. Manual OpenOCD test
+openocd -f openocd_esp32s3.cfg
+
+# 8. Monitor serial output
+idf.py -p COMX monitor

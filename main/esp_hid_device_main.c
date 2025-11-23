@@ -92,6 +92,7 @@ static bool do_calibration1_chan0 = false;
 // --- Змінні Bluetooth HID ---
 static uint16_t hid_conn_id = 0;
 static bool sec_conn = false;
+static bool ble_connected = false;
 
 // ==========================================
 // ЧАСТИНА 1: ADC / EMG (з твого файлу)
@@ -335,12 +336,22 @@ esp_err_t mpu6050_calibrate(int samples)
 // send the buttons, change in x, and change in y
 void send_mouse(uint8_t buttons, char dx, char dy, char wheel)
 {
+    if (!ble_connected || !s_ble_hid_param.hid_dev) {
+        // Не відправляємо дані, якщо не підключені
+        ESP_LOGW(TAG, "Attempted to send mouse report while not connected");
+        return;
+    }
+    
     static uint8_t buffer[4] = {0};
     buffer[0] = buttons;
     buffer[1] = dx;
     buffer[2] = dy;
     buffer[3] = wheel;
-    esp_hidd_dev_input_set(s_ble_hid_param.hid_dev, 0, 0, buffer, 4);
+    
+    esp_err_t ret = esp_hidd_dev_input_set(s_ble_hid_param.hid_dev, 0, 0, buffer, 4);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to send mouse report: %s", esp_err_to_name(ret));
+    }
 }
 
 // Головне завдання миші
@@ -353,6 +364,15 @@ void mouse_logic_task(void *pvParameters)
     float alpha = 0.98; // Комплементарний фільтр
 
     bool left_click_pressed = false;
+    bool prev_left_click_pressed = false;
+    
+    // Previous mouse values for relative movement calculation
+    int8_t prev_mouse_x = 0;
+    int8_t prev_mouse_y = 0;
+    
+    // Movement accumulator for smoother movement
+    float accumulated_x = 0.0;
+    float accumulated_y = 0.0;
 
     while (1)
     {
@@ -386,39 +406,42 @@ void mouse_logic_task(void *pvParameters)
         pitch = alpha * (pitch + gyroY * dt) + (1.0 - alpha) * acc_pitch;
 
         // 2. Маппінг руху миші (Tilt to Move)
-        // Якщо нахил Roll > 10 градусів -> рух X
-        // Якщо нахил Pitch > 10 градусів -> рух Y
+        // Обчислюємо швидкість руху на основі кута нахилу
+        
+        float mouse_vel_x = 0.0;
+        float mouse_vel_y = 0.0;
 
-        int8_t mouse_x = 0;
-        int8_t mouse_y = 0;
+        float deadzone = 5.0;     // Мертва зона в градусах (зменшено)
+        float sensitivity = 0.3;  // Чутливість руху (зменшено для плавності)
+        float max_velocity = 8.0; // Максимальна швидкість пікселів за кадр
 
-        int deadzone = 10;   // Мертва зона в градусах
-        int sensitivity = 2; // Множник швидкості
+        // Логіка X (Roll) - обчислюємо швидкість
+        if (fabs(roll) > deadzone) {
+            mouse_vel_x = (roll > 0 ? roll - deadzone : roll + deadzone) * sensitivity;
+        }
 
-        // Логіка X (Roll)
-        if (roll > deadzone)
-            mouse_x = (int8_t)((roll - deadzone) * sensitivity);
-        else if (roll < -deadzone)
-            mouse_x = (int8_t)((roll + deadzone) * sensitivity);
+        // Логіка Y (Pitch) - обчислюємо швидкість  
+        if (fabs(pitch) > deadzone) {
+            mouse_vel_y = (pitch > 0 ? pitch - deadzone : pitch + deadzone) * sensitivity;
+        }
 
-        // Логіка Y (Pitch) - інвертуємо за потребою
-        if (pitch > deadzone)
-            mouse_y = (int8_t)((pitch - deadzone) * sensitivity);
-        else if (pitch < -deadzone)
-            mouse_y = (int8_t)((pitch + deadzone) * sensitivity);
-
-        // Обмеження значень для HID звіту (-127 до 127)
-        if (mouse_x > 127)
-            mouse_x = 127;
-
-        if (mouse_x < -127)
-            mouse_x = -127;
-
-        if (mouse_y > 127)
-            mouse_y = 127;
-
-        if (mouse_y < -127)
-            mouse_y = -127;
+        // Обмежуємо максимальну швидкість
+        if (mouse_vel_x > max_velocity) mouse_vel_x = max_velocity;
+        if (mouse_vel_x < -max_velocity) mouse_vel_x = -max_velocity;
+        if (mouse_vel_y > max_velocity) mouse_vel_y = max_velocity;
+        if (mouse_vel_y < -max_velocity) mouse_vel_y = -max_velocity;
+        
+        // Накопичуємо рух
+        accumulated_x += mouse_vel_x;
+        accumulated_y += mouse_vel_y;
+        
+        // Конвертуємо в цілі пікселі для відправки
+        int8_t mouse_x = (int8_t)accumulated_x;
+        int8_t mouse_y = (int8_t)accumulated_y;
+        
+        // Віднімаємо відправлені пікселі з накопичувача
+        accumulated_x -= mouse_x;
+        accumulated_y -= mouse_y;
 
         // 3. Читаємо EMG
         int emg_voltage = read_emg_voltage();
@@ -441,12 +464,23 @@ void mouse_logic_task(void *pvParameters)
             buttons |= 0x01; // Біт 0 = Left Click
         }
 
-        // 4. Відправка даних, якщо є зміни або натиснута кнопка
-        if (mouse_x != 0 || mouse_y != 0 || buttons != 0 || left_click_pressed)
+        // 4. Відправка даних тільки при змінах
+        bool button_changed = (left_click_pressed != prev_left_click_pressed);
+        bool movement_detected = (mouse_x != 0 || mouse_y != 0);
+        
+        if (movement_detected || button_changed)
         {
-            // Навіть якщо x=0, y=0, але кнопка затиснута, треба слати звіт
-            send_mouse(buttons, mouse_x, mouse_y, 0);
+            if (ble_connected) {
+                send_mouse(buttons, mouse_x, mouse_y, 0);
+                ESP_LOGI(TAG, "Mouse Report - X: %d, Y: %d, Buttons: %02X (Roll: %.1f, Pitch: %.1f)", 
+                         mouse_x, mouse_y, buttons, roll, pitch);
+            } else {
+                ESP_LOGW(TAG, "Not connected - X: %d, Y: %d, Buttons: %02X", mouse_x, mouse_y, buttons);
+            }
         }
+        
+        // Запам'ятовуємо попередній стан кнопки
+        prev_left_click_pressed = left_click_pressed;
 
         // Затримка циклу (важлива для dt та частоти опитування)
         vTaskDelay(pdMS_TO_TICKS(10)); // 10ms = 100Hz
@@ -507,6 +541,7 @@ static void ble_hidd_event_callback(void *handler_args, esp_event_base_t base, i
     case ESP_HIDD_CONNECT_EVENT:
     {
         ESP_LOGI(TAG, "CONNECT");
+        ble_connected = true;
         break;
     }
     case ESP_HIDD_PROTOCOL_MODE_EVENT:
@@ -544,6 +579,7 @@ static void ble_hidd_event_callback(void *handler_args, esp_event_base_t base, i
     case ESP_HIDD_DISCONNECT_EVENT:
     {
         ESP_LOGI(TAG, "DISCONNECT: %s", esp_hid_disconnect_reason_str(esp_hidd_dev_transport_get(param->disconnect.dev), param->disconnect.reason));
+        ble_connected = false;
         ble_hid_task_shut_down();
         esp_hid_ble_gap_adv_start();
         break;
@@ -667,37 +703,3 @@ void app_main(void)
     }
 #endif
 }
-
-// void app_main(void)
-// {
-//     esp_err_t ret;
-
-//     // 1. Init NVS (потрібно для BT)
-//     ret = nvs_flash_init();
-//     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-//         ESP_ERROR_CHECK(nvs_flash_erase());
-//         ret = nvs_flash_init();
-//     }
-//     ESP_ERROR_CHECK(ret);
-
-//     // 2. Init Peripherals
-//     ESP_LOGI(TAG, "Initializing I2C and ADC...");
-//     i2c_master_init();
-//     configure_adc();
-
-//     ESP_LOGI(TAG, "Initializing MPU6050...");
-//     mpu6050_init_sensor();
-//     mpu6050_calibrate(100); // Калібрування гіроскопа (не рухай плату!)
-
-//     // 3. Init Bluetooth HID Device
-//     ESP_LOGI(TAG, "Initializing Bluetooth HID...");
-//     // В реальному прикладі тут ініціалізується стек ESP-HID
-//     // Цей рядок вимагає налаштованого компоненту esp_hid_device
-//     esp_hid_gap_init(ESP_BT_MODE_BLE);
-//     esp_hid_ble_gap_adv_init(ESP_HID_APPEARANCE_MOUSE, "ESP32 EMG Mouse");
-
-//     ESP_ERROR_CHECK(
-//         esp_hidd_dev_init(&ble_hid_config, ESP_HID_TRANSPORT_BLE, ble_hidd_event_callback, &s_ble_hid_param.hid_dev));
-//     // 4. Start Logic Task
-//     //xTaskCreate(&mouse_logic_task, "mouse_task", 4096, NULL, 5, NULL);
-// }
