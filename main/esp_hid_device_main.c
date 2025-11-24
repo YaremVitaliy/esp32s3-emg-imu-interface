@@ -73,6 +73,22 @@ static const char *TAG = "BLE_MOUSE";
 #define MPU6050_GYRO_XOUT_H 0x43
 #define MPU6050_WHO_AM_I 0x75
 
+#define MOUSE_SENSITIVITY 10
+#define MOTION_GAIN 2
+#define YAW_DRIFT_DEADZONE 0.6f
+#define YAW_BIAS_SLOW_ALPHA 0.002f
+#define YAW_BIAS_FAST_ALPHA 0.02f
+#define YAW_STILL_GYRO_THRESH 1.5f
+#define YAW_STILL_HOLD_MS 150
+#define YAW_INPUT_MIN   -350
+#define YAW_INPUT_MAX    900
+#define YAW_OUTPUT_MIN -1400
+#define YAW_OUTPUT_MAX  3200
+#define ROLL_INPUT_MIN  -600
+#define ROLL_INPUT_MAX   600
+#define ROLL_OUTPUT_MIN 1600
+#define ROLL_OUTPUT_MAX -2000
+
 // --- КОНФІГУРАЦІЯ EMG ---
 #define EMG_GPIO_PIN GPIO_NUM_1
 #define EMG_ADC_CHANNEL ADC_CHANNEL_0
@@ -94,13 +110,43 @@ static const char *TAG = "BLE_MOUSE";
 #define EMG_DYNAMIC_MARGIN_MV 15           // Додаткова надбавка до динамічного порога
 #define EMG_NOISE_UPDATE_ALPHA 0.008f      // Швидкість оновлення оцінки шуму
 #define EMG_RELEASE_SCALE 0.2f             // Відносний рівень відпускання відносно порога активації
-#define EMG_LIVE_LOG_ENABLED 1             // 1 = виводити EMG у реальному часі
+#define EMG_LIVE_LOG_ENABLED 0             // 1 = виводити EMG у реальному часі
 #define EMG_LIVE_LOG_INTERVAL_MS 50        // Період логування в мілісекундах
 
 // --- Змінні MPU ---
 float pitch = 0.0, roll = 0.0;
 float gyro_offset_x = 0.0, gyro_offset_y = 0.0, gyro_offset_z = 0.0;
 float dt = 0.01; // 10ms loop
+static float yaw_angle = 0.0f;
+static float yaw_bias = 0.0f;
+
+typedef struct {
+    int32_t prev_abs_x;
+    int32_t prev_abs_y;
+    int32_t residual_dx;
+    int32_t residual_dy;
+} mouse_mapping_state_t;
+
+static mouse_mapping_state_t mouse_map_state = {0};
+
+static inline int32_t map_value(int32_t x, int32_t in_min, int32_t in_max, int32_t out_min, int32_t out_max)
+{
+    if (in_max == in_min) {
+        return out_min;
+    }
+    return (int32_t)((int64_t)(x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min);
+}
+
+static inline int32_t clamp_i32(int32_t value, int32_t min_value, int32_t max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
 
 // --- Змінні ADC ---
 static adc_oneshot_unit_handle_t adc1_handle;
@@ -541,14 +587,6 @@ esp_err_t mpu6050_calibrate(int samples)
 // ЧАСТИНА 3: Логіка Миші
 // ==========================================
 
-// Функція відправки звіту миші (X, Y, Button)
-// void send_mouse_report(int8_t x, int8_t y, uint8_t buttons) {
-//     if (sec_conn) { // Тільки якщо Bluetooth підключено
-//         // Ця функція є частиною esp_hidd API
-//         esp_hidd_send_mouse_value(hid_conn_id, buttons, x, y);
-//     }
-// }
-
 // send the buttons, change in x, and change in y
 void send_mouse(uint8_t buttons, char dx, char dy, char wheel)
 {
@@ -584,29 +622,22 @@ void mouse_logic_task(void *pvParameters)
     // Ініціалізуємо EMG фільтр
     emg_filter_init();
     ESP_LOGI(TAG, "EMG filter initialized. Collecting baseline samples...");
-    
-    // Previous mouse values for relative movement calculation
-    int8_t prev_mouse_x = 0;
-    int8_t prev_mouse_y = 0;
-    
-    // Movement accumulator for smoother movement
-    float accumulated_x = 0.0;
-    float accumulated_y = 0.0;
+    static bool absolute_position_initialized = false;
+    static bool yaw_stationary = false;
+    static uint32_t yaw_stationary_start_ms = 0;
+    mouse_map_state.prev_abs_x = 0;
+    mouse_map_state.prev_abs_y = 0;
+    mouse_map_state.residual_dx = 0;
+    mouse_map_state.residual_dy = 0;
+    absolute_position_initialized = false;
+    yaw_stationary = false;
+    yaw_stationary_start_ms = 0;
+    yaw_bias = 0.0f;
     
     // Low-pass filter for angle smoothing (still used for diagnostics)
-    float filtered_roll = 0.0;
-    float filtered_pitch = 0.0;
-    float filter_alpha = 0.7;  // Filter coefficient (0 = no filtering, 1 = max filtering)
-    
-    // Low-pass filter for gyroscope data (for air mouse)
-    float filtered_gyroX = 0.0;
-    float filtered_gyroY = 0.0;
-    float gyro_filter_alpha = 0.8;  // Дуже агресивна фільтрація для усунення ривків
-    
-    // Additional smoothing for very stable movement
-    float smooth_gyroX = 0.0;
-    float smooth_gyroY = 0.0;
-    float smooth_alpha = 0.9;  // Додаткове згладжування
+    float filtered_roll = 0.0f;
+    float filtered_yaw = 0.0f;
+    float filter_alpha = 0.7f;  // Filter coefficient (0 = no filtering, 1 = max filtering)
     
     // Movement detection
     uint32_t last_movement_time = 0;
@@ -644,69 +675,78 @@ void mouse_logic_task(void *pvParameters)
         pitch = alpha * (pitch + gyroY * dt) + (1.0 - alpha) * acc_pitch;
         
         // Застосовуємо фільтр низьких частот для згладжування
-        filtered_roll = filter_alpha * filtered_roll + (1.0 - filter_alpha) * roll;
-        filtered_pitch = filter_alpha * filtered_pitch + (1.0 - filter_alpha) * pitch;
-        
-        // Багаторівнева фільтрація гіроскопа для air mouse
-        filtered_gyroX = gyro_filter_alpha * filtered_gyroX + (1.0 - gyro_filter_alpha) * gyroX;
-        filtered_gyroY = gyro_filter_alpha * filtered_gyroY + (1.0 - gyro_filter_alpha) * gyroY;
-        
-        // Додаткове згладжування для усунення ривків
-        smooth_gyroX = smooth_alpha * smooth_gyroX + (1.0 - smooth_alpha) * filtered_gyroX;
-        smooth_gyroY = smooth_alpha * smooth_gyroY + (1.0 - smooth_alpha) * filtered_gyroY;
+        filtered_roll = filter_alpha * filtered_roll + (1.0f - filter_alpha) * roll;
 
-        // 2. Air Mouse - Маппінг руху миші на основі гіроскопа (швидкість обертання)
-        // Використовуємо гіроскоп для детекції переміщення в просторі
-        
-        float mouse_vel_x = 0.0;
-        float mouse_vel_y = 0.0;
+        // Інтегруємо Z-вісь гіроскопа для розрахунку кута yaw
+        float gyroZ = ((float)gz / gyro_sensitivity) - gyro_offset_z;
+        yaw_angle += gyroZ * dt;
+        if (yaw_angle > 180.0f) {
+            yaw_angle -= 360.0f;
+        } else if (yaw_angle < -180.0f) {
+            yaw_angle += 360.0f;
+        }
+        filtered_yaw = filter_alpha * filtered_yaw + (1.0f - filter_alpha) * yaw_angle;
 
-        float gyro_deadzone = 3.0;    // Збільшена мертва зона для стабільності
-        float gyro_sensitivity = 0.8; // Значно зменшена чутливість для плавності
-        float max_velocity = 8.0;     // Зменшена максимальна швидкість
+        uint32_t loop_time_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        bool gyro_still = fabsf(gyroX) < YAW_STILL_GYRO_THRESH &&
+                          fabsf(gyroY) < YAW_STILL_GYRO_THRESH &&
+                          fabsf(gyroZ) < YAW_STILL_GYRO_THRESH;
 
-        // Air Mouse логіка X - використовуємо подвійно фільтрований гіроскоп Y
-        if (fabs(smooth_gyroY) > gyro_deadzone) {
-            float effective_gyroY = smooth_gyroY > 0 ? smooth_gyroY - gyro_deadzone : smooth_gyroY + gyro_deadzone;
-            mouse_vel_x = effective_gyroY * gyro_sensitivity;
+        if (gyro_still) {
+            if (!yaw_stationary) {
+                yaw_stationary = true;
+                yaw_stationary_start_ms = loop_time_ms;
+            }
         } else {
-            mouse_vel_x = 0.0;
+            yaw_stationary = false;
         }
 
-        // Air Mouse логіка Y - використовуємо подвійно фільтрований гіроскоп X
-        // Інвертуємо для природної поведінки (нахил вперед = рух вгору)
-        if (fabs(smooth_gyroX) > gyro_deadzone) {
-            float effective_gyroX = smooth_gyroX > 0 ? smooth_gyroX - gyro_deadzone : smooth_gyroX + gyro_deadzone;
-            mouse_vel_y = -effective_gyroX * gyro_sensitivity; // Інвертовано
+        float bias_alpha = 0.0f;
+        if (yaw_stationary && (loop_time_ms - yaw_stationary_start_ms) >= YAW_STILL_HOLD_MS) {
+            bias_alpha = YAW_BIAS_FAST_ALPHA;
+        } else if (fabsf(gyroZ) < YAW_DRIFT_DEADZONE) {
+            bias_alpha = YAW_BIAS_SLOW_ALPHA;
+        }
+
+        if (bias_alpha > 0.0f) {
+            yaw_bias = yaw_bias * (1.0f - bias_alpha) + filtered_yaw * bias_alpha;
+        }
+        float corrected_yaw = filtered_yaw - yaw_bias;
+
+        // 2. Arduino-style yaw/pitch mapping for mouse movement
+        double dx = (double)(-corrected_yaw) * MOUSE_SENSITIVITY;
+        double dz = (double)filtered_roll * MOUSE_SENSITIVITY;
+        int32_t raw_x = (int32_t)dx;
+        int32_t raw_y = (int32_t)dz;
+
+        int32_t mapped_x = map_value(raw_x, YAW_INPUT_MIN, YAW_INPUT_MAX, YAW_OUTPUT_MIN, YAW_OUTPUT_MAX);
+        int32_t mapped_y = map_value(raw_y, ROLL_INPUT_MIN, ROLL_INPUT_MAX, ROLL_OUTPUT_MIN, ROLL_OUTPUT_MAX);
+
+        int32_t delta_x = 0;
+        int32_t delta_y = 0;
+        if (!absolute_position_initialized) {
+            mouse_map_state.prev_abs_x = mapped_x;
+            mouse_map_state.prev_abs_y = mapped_y;
+            absolute_position_initialized = true;
         } else {
-            mouse_vel_y = 0.0;
+            delta_x = mapped_x - mouse_map_state.prev_abs_x;
+            delta_y = mapped_y - mouse_map_state.prev_abs_y;
+            mouse_map_state.prev_abs_x = mapped_x;
+            mouse_map_state.prev_abs_y = mapped_y;
         }
 
-        // Обмежуємо максимальну швидкість
-        mouse_vel_x = fmaxf(-max_velocity, fminf(max_velocity, mouse_vel_x));
-        mouse_vel_y = fmaxf(-max_velocity, fminf(max_velocity, mouse_vel_y));
-        
-        // Накопичуємо рух з кращим згладжуванням
-        float min_velocity_threshold = 0.1;  // Знижений поріг для кращої відзивчості
-        
-        // Плавне накопичення руху
-        accumulated_x = 0.7 * accumulated_x + 0.3 * mouse_vel_x;
-        accumulated_y = 0.7 * accumulated_y + 0.3 * mouse_vel_y;
-        
-        // Застосовуємо мертву зону до накопичених значень
-        if (fabs(accumulated_x) < min_velocity_threshold) accumulated_x = 0.0;
-        if (fabs(accumulated_y) < min_velocity_threshold) accumulated_y = 0.0;
-        
-        // Конвертуємо в цілі пікселі для відправки тільки якщо накопичилося достатньо
-        int8_t mouse_x = 0, mouse_y = 0;
-        if (fabs(accumulated_x) >= 1.0) {
-            mouse_x = (int8_t)roundf(accumulated_x);
-            accumulated_x -= mouse_x;
-        }
-        if (fabs(accumulated_y) >= 1.0) {
-            mouse_y = (int8_t)roundf(accumulated_y);
-            accumulated_y -= mouse_y;
-        }
+        delta_x *= MOTION_GAIN;
+        delta_y *= MOTION_GAIN;
+
+        // Додаємо залишок (аналог OffsetX/OffsetY у Arduino коді)
+        int32_t desired_dx = delta_x + mouse_map_state.residual_dx;
+        int32_t desired_dy = delta_y + mouse_map_state.residual_dy;
+
+        int8_t mouse_x = (int8_t)clamp_i32(desired_dx, -127, 127);
+        int8_t mouse_y = (int8_t)clamp_i32(desired_dy, -127, 127);
+
+        mouse_map_state.residual_dx = desired_dx - mouse_x;
+        mouse_map_state.residual_dy = desired_dy - mouse_y;
 
         // 3. Читаємо та обробляємо EMG з покращеною фільтрацією
         int raw_emg_voltage = read_emg_voltage();
@@ -723,7 +763,7 @@ void mouse_logic_task(void *pvParameters)
         // Оновлюємо стан для логіки відправки
         bool emg_state_changed = (current_emg_active != left_click_pressed);
         left_click_pressed = current_emg_active;
-        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        uint32_t current_time = loop_time_ms;
 
     #if EMG_LIVE_LOG_ENABLED
         static uint32_t last_live_log_ms = 0;
@@ -759,21 +799,22 @@ void mouse_logic_task(void *pvParameters)
             
             // Логування тільки для значущих подій
             if (movement_detected || emg_state_changed) {
-                // ESP_LOGI(TAG, "AIR MOUSE - X: %d, Y: %d, Buttons: %02X (SmoothGyroX: %.1f, SmoothGyroY: %.1f)", 
-                //          mouse_x, mouse_y, buttons, smooth_gyroX, smooth_gyroY);
+                // ESP_LOGI(TAG, "AIR MOUSE - dx: %d, dy: %d, Buttons: %02X, mapped(%ld,%ld)",
+                //          mouse_x, mouse_y, buttons, (long)mapped_x, (long)mapped_y);
             }
         } else if (emg_state_changed && !ble_connected) {
             ESP_LOGW(TAG, "Not connected - Button change detected: %02X", buttons);
         }
         
-        // Діагностика тільки при значних змінах гіроскопа (рівень DEBUG)
-        static float last_logged_gyroX = 0;
-        static float last_logged_gyroY = 0;
-        if (fabs(smooth_gyroX - last_logged_gyroX) > 2.0 || fabs(smooth_gyroY - last_logged_gyroY) > 2.0) {
-            ESP_LOGD(TAG, "AIR MOUSE update - SGyroX: %.1f, SGyroY: %.1f, VelX: %.2f, VelY: %.2f, AccX: %.2f, AccY: %.2f", 
-                     smooth_gyroX, smooth_gyroY, mouse_vel_x, mouse_vel_y, accumulated_x, accumulated_y);
-            last_logged_gyroX = smooth_gyroX;
-            last_logged_gyroY = smooth_gyroY;
+        // Діагностика тільки при значних змінах кутів (рівень DEBUG)
+        static float last_logged_yaw = 0.0f;
+        static float last_logged_roll = 0.0f;
+        if (fabs(corrected_yaw - last_logged_yaw) > 2.0f || fabs(filtered_roll - last_logged_roll) > 2.0f) {
+            ESP_LOGI(TAG, "YPR mapping - Yaw: %.2f, Roll: %.2f, delta(%ld,%ld), residual(%ld,%ld)",
+                     corrected_yaw, filtered_roll, (long)delta_x, (long)delta_y,
+                     (long)mouse_map_state.residual_dx, (long)mouse_map_state.residual_dy);
+            last_logged_yaw = corrected_yaw;
+            last_logged_roll = filtered_roll;
         }
         
         // Додаткове діагностичне логування для EMG (тільки при змінах)
