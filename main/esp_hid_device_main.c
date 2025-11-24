@@ -80,10 +80,22 @@ static const char *TAG = "BLE_MOUSE";
 #define EMG_ADC_ATTEN ADC_ATTEN_DB_12
 #define EMG_ADC_BITWIDTH ADC_BITWIDTH_12
 
-// Поріг спрацювання EMG (у мілівольтах). Потрібно підлаштувати під твій м'яз!
-#define EMG_CLICK_THRESHOLD_MV 1800
-// Гістерезис, щоб кнопка не "дренчала"
-#define EMG_RELEASE_THRESHOLD_MV 1500
+// Покращені параметри EMG детекції
+#define EMG_BASELINE_SAMPLES 120           // Кількість зразків для обчислення базової лінії
+#define EMG_FILTER_SAMPLES 8               // Кількість зразків для ковзного середнього
+#define EMG_NOISE_THRESHOLD_MV 60          // Мінімальна різниця від базової лінії для адаптації
+#define EMG_ACTIVATION_THRESHOLD_MV 30     // Мінімальний поріг активації відносно базової лінії 70
+#define EMG_RELEASE_THRESHOLD_MV 35        // Мінімальний поріг відпускання відносно базової лінії
+#define EMG_MIN_ACTIVATION_TIME_MS 50      // Мінімальний час утримання для валідного кліка
+#define EMG_DEBOUNCE_TIME_MS 150           // Час антидеребезгу між кліками
+#define EMG_BASELINE_UPDATE_RATE 0.0003    // Швидкість адаптації базової лінії
+#define EMG_STABILITY_CHECK_SAMPLES 3      // Кількість стабільних зразків для підтвердження активації
+#define EMG_REFRACTORY_TIME_MS 250         // Час "мертвого" періоду після відпускання
+#define EMG_DYNAMIC_MARGIN_MV 15           // Додаткова надбавка до динамічного порога
+#define EMG_NOISE_UPDATE_ALPHA 0.008f      // Швидкість оновлення оцінки шуму
+#define EMG_RELEASE_SCALE 0.2f             // Відносний рівень відпускання відносно порога активації
+#define EMG_LIVE_LOG_ENABLED 1             // 1 = виводити EMG у реальному часі
+#define EMG_LIVE_LOG_INTERVAL_MS 50        // Період логування в мілісекундах
 
 // --- Змінні MPU ---
 float pitch = 0.0, roll = 0.0;
@@ -94,6 +106,29 @@ float dt = 0.01; // 10ms loop
 static adc_oneshot_unit_handle_t adc1_handle;
 static adc_cali_handle_t adc1_cali_chan0_handle = NULL;
 static bool do_calibration1_chan0 = false;
+
+// --- Структура для EMG фільтрації ---
+typedef struct {
+    int voltage_buffer[EMG_FILTER_SAMPLES];
+    int buffer_index;
+    float baseline_voltage;
+    bool baseline_initialized;
+    uint32_t last_activation_time;
+    uint32_t last_deactivation_time;
+    bool is_active;
+    bool is_confirmed_active;  // Підтверджена активація після мінімального часу
+    int activation_counter;
+    int stable_activation_count;  // Лічильник стабільних високих показань
+    int stable_release_count;     // Лічильник стабільних низьких показань
+    float noise_floor_mv;         // Оцінка рівня шуму (амплітуда)
+    float dynamic_activation_threshold_mv;
+    float dynamic_release_threshold_mv;
+    uint32_t refractory_until_ms;
+} emg_filter_t;
+
+static emg_filter_t emg_filter = {0};
+static int emg_diag_last_diff = 0;
+static uint32_t emg_diag_last_log_ms = 0;
 
 // --- Змінні Bluetooth HID ---
 static uint16_t hid_conn_id = 0;
@@ -199,7 +234,6 @@ static void configure_adc(void)
 
     adc_oneshot_chan_cfg_t config = {.bitwidth = EMG_ADC_BITWIDTH, .atten = EMG_ADC_ATTEN};
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, EMG_ADC_CHANNEL, &config));
-
     do_calibration1_chan0 = adc_calibration_init(EMG_ADC_UNIT, EMG_ADC_CHANNEL, EMG_ADC_ATTEN, &adc1_cali_chan0_handle);
 }
 
@@ -218,6 +252,182 @@ static int read_emg_voltage(void)
         voltage = adc_raw; // Fallback if no calibration
     }
     return voltage;
+}
+
+// Ініціалізація EMG фільтра
+static void emg_filter_init(void)
+{
+    memset(&emg_filter, 0, sizeof(emg_filter_t));
+    emg_filter.baseline_voltage = 1500.0; // Початкове значення базової лінії
+    emg_filter.is_active = false;
+    emg_filter.is_confirmed_active = false;
+    emg_filter.stable_activation_count = 0;
+    emg_filter.stable_release_count = 0;
+    emg_filter.noise_floor_mv = 0.0f;
+    emg_filter.dynamic_activation_threshold_mv = EMG_ACTIVATION_THRESHOLD_MV;
+    emg_filter.dynamic_release_threshold_mv = EMG_RELEASE_THRESHOLD_MV;
+    emg_filter.refractory_until_ms = 0;
+}
+
+// Оновлення ковзного середнього для EMG
+static int emg_filter_update(int new_voltage)
+{
+    // Додаємо новий зразок до буфера
+    emg_filter.voltage_buffer[emg_filter.buffer_index] = new_voltage;
+    emg_filter.buffer_index = (emg_filter.buffer_index + 1) % EMG_FILTER_SAMPLES;
+    
+    // Обчислюємо ковзне середнє
+    int sum = 0;
+    for (int i = 0; i < EMG_FILTER_SAMPLES; i++) {
+        sum += emg_filter.voltage_buffer[i];
+    }
+    int filtered_voltage = sum / EMG_FILTER_SAMPLES;
+    
+    // Ініціалізуємо або повільно адаптуємо базову лінію
+    if (!emg_filter.baseline_initialized) {
+        // Перші кілька зразків - швидка ініціалізація
+        static int init_samples = 0;
+        if (init_samples < EMG_BASELINE_SAMPLES) {
+            emg_filter.baseline_voltage = (emg_filter.baseline_voltage * init_samples + filtered_voltage) / (init_samples + 1);
+            init_samples++;
+        } else {
+            emg_filter.baseline_initialized = true;
+            ESP_LOGI(TAG, "EMG baseline initialized: %.1f mV", emg_filter.baseline_voltage);
+        }
+    } else {
+        // Повільна адаптація базової лінії тільки коли немає активності
+        int diff = abs(filtered_voltage - (int)emg_filter.baseline_voltage);
+        if (diff < EMG_NOISE_THRESHOLD_MV && !emg_filter.is_active) {
+            emg_filter.baseline_voltage = emg_filter.baseline_voltage * (1.0 - EMG_BASELINE_UPDATE_RATE) + 
+                                         filtered_voltage * EMG_BASELINE_UPDATE_RATE;
+        }
+    }
+
+    // Оцінюємо рівень шуму та динамічні пороги, коли базова лінія вже визначена
+    if (emg_filter.baseline_initialized) {
+        int baseline_mv = (int)emg_filter.baseline_voltage;
+        int voltage_diff = filtered_voltage - baseline_mv;
+        int voltage_diff_abs = abs(voltage_diff);
+
+        if (!emg_filter.is_active) {
+            float alpha = EMG_NOISE_UPDATE_ALPHA;
+            float capped_diff = (float)voltage_diff_abs;
+            if (emg_filter.dynamic_activation_threshold_mv > 0 &&
+                capped_diff > emg_filter.dynamic_activation_threshold_mv * 0.8f) {
+                // Ігноруємо великі сплески при оновленні шуму
+                capped_diff = emg_filter.dynamic_activation_threshold_mv * 0.8f;
+            }
+            if (emg_filter.noise_floor_mv == 0.0f) {
+                emg_filter.noise_floor_mv = capped_diff;
+            } else {
+                emg_filter.noise_floor_mv = (1.0f - alpha) * emg_filter.noise_floor_mv + alpha * capped_diff;
+            }
+        }
+
+        float dynamic_activation = fmaxf((float)EMG_ACTIVATION_THRESHOLD_MV,
+                                         emg_filter.noise_floor_mv + (float)EMG_DYNAMIC_MARGIN_MV);
+        float dynamic_release = fmaxf((float)EMG_RELEASE_THRESHOLD_MV,
+                                      dynamic_activation * EMG_RELEASE_SCALE);
+
+        emg_filter.dynamic_activation_threshold_mv = dynamic_activation;
+        emg_filter.dynamic_release_threshold_mv = dynamic_release;
+    }
+    
+    return filtered_voltage;
+}
+
+// Покращена детекція EMG активації з перевіркою стабільності
+static bool emg_detect_activation(int filtered_voltage)
+{
+    if (!emg_filter.baseline_initialized) {
+        return false; // Не детектуємо поки базова лінія не ініціалізована
+    }
+    
+    uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    int voltage_diff = filtered_voltage - (int)emg_filter.baseline_voltage;
+    float activation_threshold = emg_filter.dynamic_activation_threshold_mv;
+    float release_threshold = emg_filter.dynamic_release_threshold_mv;
+    if (activation_threshold <= 0.0f) {
+        activation_threshold = EMG_ACTIVATION_THRESHOLD_MV;
+    }
+    if (release_threshold <= 0.0f) {
+        release_threshold = EMG_RELEASE_THRESHOLD_MV;
+    }
+    bool above_activation = (float)voltage_diff > activation_threshold;
+    bool below_release = (float)voltage_diff < release_threshold;
+    
+    // Періодичне діагностичне логування при відсутності активації
+    if (!emg_filter.is_active && emg_filter.baseline_initialized && activation_threshold > 0.0f) {
+        if (voltage_diff > 0 && (float)voltage_diff > activation_threshold * 0.45f) {
+            if (current_time - emg_diag_last_log_ms >= 500) {
+                emg_diag_last_log_ms = current_time;
+                emg_diag_last_diff = voltage_diff;
+                ESP_LOGI(TAG, "EMG monitor: Diff=%d mV, Th=%.1f/%.1f, Noise=%.1f", 
+                         voltage_diff, activation_threshold, release_threshold, emg_filter.noise_floor_mv);
+            }
+        }
+    }
+    
+    // Примусова пауза після відпускання
+    if (current_time < emg_filter.refractory_until_ms) {
+        return false;
+    }
+    
+    // Перевіряємо антидеребезг
+    if (current_time - emg_filter.last_deactivation_time < EMG_DEBOUNCE_TIME_MS) {
+        return emg_filter.is_confirmed_active; // Зберігаємо попередній ПІДТВЕРДЖЕНИЙ стан під час дебаунсу
+    }
+    
+    if (!emg_filter.is_active) {
+        // Перевіряємо чи сигнал стабільно високий
+        if (above_activation) {
+            emg_filter.stable_activation_count++;
+            emg_filter.stable_release_count = 0; // Скидаємо лічильник відпускання
+            
+            // Активуємо тільки після кількох стабільних високих зразків
+            if (emg_filter.stable_activation_count >= EMG_STABILITY_CHECK_SAMPLES) {
+                emg_filter.last_activation_time = current_time;
+                emg_filter.activation_counter++;
+                emg_filter.is_active = true;
+                emg_filter.is_confirmed_active = false; // Ще не підтверджено
+                ESP_LOGI(TAG, "EMG ACTIVATION START! Diff: %d mV, Th: %.1f/%.1f, Baseline: %.1f mV", 
+                         voltage_diff, activation_threshold, release_threshold, emg_filter.baseline_voltage);
+            }
+        } else {
+            emg_filter.stable_activation_count = 0; // Скидаємо лічильник активації
+        }
+    } else {
+        // Перевіряємо мінімальний час активації для підтвердження
+        if (!emg_filter.is_confirmed_active && 
+            current_time - emg_filter.last_activation_time >= EMG_MIN_ACTIVATION_TIME_MS) {
+            emg_filter.is_confirmed_active = true;
+            ESP_LOGI(TAG, "EMG ACTIVATION CONFIRMED! Duration: %lu ms", 
+                     current_time - emg_filter.last_activation_time);
+        }
+        
+        // Перевіряємо деактивацію - також потрібна стабільність
+        if (below_release) {
+            emg_filter.stable_release_count++;
+            emg_filter.stable_activation_count = 0; // Скидаємо лічильник активації
+            
+            // Деактивуємо тільки після кількох стабільних низьких зразків
+            if (emg_filter.stable_release_count >= EMG_STABILITY_CHECK_SAMPLES) {
+                emg_filter.last_deactivation_time = current_time;
+                emg_filter.is_active = false;
+                emg_filter.is_confirmed_active = false;
+                emg_filter.stable_activation_count = 0;
+                emg_filter.stable_release_count = 0;
+                emg_filter.refractory_until_ms = current_time + EMG_REFRACTORY_TIME_MS;
+                ESP_LOGI(TAG, "EMG DEACTIVATION! Diff: %d mV, Total Duration: %lu ms (Refractory %u ms)", 
+                         voltage_diff, current_time - emg_filter.last_activation_time, EMG_REFRACTORY_TIME_MS);
+            }
+        } else {
+            emg_filter.stable_release_count = 0; // Скидаємо лічильник відпускання
+        }
+    }
+    
+    // Повертаємо тільки підтверджену активацію
+    return emg_filter.is_confirmed_active;
 }
 
 // ==========================================
@@ -370,7 +580,10 @@ void mouse_logic_task(void *pvParameters)
     float alpha = 0.98; // Комплементарний фільтр
 
     bool left_click_pressed = false;
-    bool prev_left_click_pressed = false;
+    
+    // Ініціалізуємо EMG фільтр
+    emg_filter_init();
+    ESP_LOGI(TAG, "EMG filter initialized. Collecting baseline samples...");
     
     // Previous mouse values for relative movement calculation
     int8_t prev_mouse_x = 0;
@@ -404,7 +617,7 @@ void mouse_logic_task(void *pvParameters)
         // 1. Читаємо MPU
         esp_err_t mpu_ret = mpu6050_read(MPU6050_ACCEL_XOUT_H, data, 14);
         if (mpu_ret != ESP_OK) {
-            ESP_LOGW(TAG, "MPU6050 read failed: %s", esp_err_to_name(mpu_ret));
+            //ESP_LOGW(TAG, "MPU6050 read failed: %s", esp_err_to_name(mpu_ret));
             // Use previous values or defaults, don't crash
             ax = ay = az = gx = gy = gz = 0;
         } else {
@@ -495,36 +708,46 @@ void mouse_logic_task(void *pvParameters)
             accumulated_y -= mouse_y;
         }
 
-        // 3. Читаємо EMG
-        int emg_voltage = read_emg_voltage();
+        // 3. Читаємо та обробляємо EMG з покращеною фільтрацією
+        int raw_emg_voltage = read_emg_voltage();
+        int filtered_emg_voltage = emg_filter_update(raw_emg_voltage);
+        
+        // Використовуємо покращену детекцію активації
+        bool current_emg_active = emg_detect_activation(filtered_emg_voltage);
+        
         uint8_t buttons = 0;
-
-        // Логіка кліка (з гістерезисом)
-        if (!left_click_pressed && emg_voltage > EMG_CLICK_THRESHOLD_MV)
-        {
-            left_click_pressed = true;
-            ESP_LOGI(TAG, "CLICK DOWN! (Voltage: %d mV)", emg_voltage);
-        }
-        else if (left_click_pressed && emg_voltage < EMG_RELEASE_THRESHOLD_MV)
-        {
-            left_click_pressed = false;
-            ESP_LOGI(TAG, "CLICK UP! (Voltage: %d mV)", emg_voltage);
-        }
-
-        if (left_click_pressed)
-        {
+        if (current_emg_active) {
             buttons |= 0x01; // Біт 0 = Left Click
         }
+        
+        // Оновлюємо стан для логіки відправки
+        bool emg_state_changed = (current_emg_active != left_click_pressed);
+        left_click_pressed = current_emg_active;
+        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    #if EMG_LIVE_LOG_ENABLED
+        static uint32_t last_live_log_ms = 0;
+        if (emg_filter.baseline_initialized && current_time - last_live_log_ms >= EMG_LIVE_LOG_INTERVAL_MS) {
+            last_live_log_ms = current_time;
+            float live_act_th = emg_filter.dynamic_activation_threshold_mv > 0.0f ?
+                    emg_filter.dynamic_activation_threshold_mv : (float)EMG_ACTIVATION_THRESHOLD_MV;
+            float live_rel_th = emg_filter.dynamic_release_threshold_mv > 0.0f ?
+                    emg_filter.dynamic_release_threshold_mv : (float)EMG_RELEASE_THRESHOLD_MV;
+            int live_diff = filtered_emg_voltage - (int)emg_filter.baseline_voltage;
+            ESP_LOGI(TAG, "EMG LIVE: raw=%d mV, filt=%d mV, base=%.1f mV, diff=%d mV, thr=%.1f/%.1f, noise=%.1f, active=%s",
+                 raw_emg_voltage, filtered_emg_voltage, emg_filter.baseline_voltage, live_diff,
+                 live_act_th, live_rel_th, emg_filter.noise_floor_mv,
+                 current_emg_active ? "YES" : "NO");
+        }
+    #endif
 
         // 4. Відправка даних тільки при справжніх змінах з контролем часу
-        bool button_changed = (left_click_pressed != prev_left_click_pressed);
         bool movement_detected = (mouse_x != 0 || mouse_y != 0);
-        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
         
         // Відправляємо дані тільки якщо:
         // 1) Змінилася кнопка (негайно)
         // 2) Є рух И пройшов мінімальний час з останньої відправки
-        bool should_send = button_changed || 
+        bool should_send = emg_state_changed || 
                           (movement_detected && (current_time - last_movement_time >= movement_timeout_ms));
         
         if (should_send && ble_connected) {
@@ -535,11 +758,11 @@ void mouse_logic_task(void *pvParameters)
             }
             
             // Логування тільки для значущих подій
-            if (movement_detected || button_changed) {
-                ESP_LOGI(TAG, "AIR MOUSE - X: %d, Y: %d, Buttons: %02X (SmoothGyroX: %.1f, SmoothGyroY: %.1f)", 
-                         mouse_x, mouse_y, buttons, smooth_gyroX, smooth_gyroY);
+            if (movement_detected || emg_state_changed) {
+                // ESP_LOGI(TAG, "AIR MOUSE - X: %d, Y: %d, Buttons: %02X (SmoothGyroX: %.1f, SmoothGyroY: %.1f)", 
+                //          mouse_x, mouse_y, buttons, smooth_gyroX, smooth_gyroY);
             }
-        } else if (button_changed && !ble_connected) {
+        } else if (emg_state_changed && !ble_connected) {
             ESP_LOGW(TAG, "Not connected - Button change detected: %02X", buttons);
         }
         
@@ -553,8 +776,17 @@ void mouse_logic_task(void *pvParameters)
             last_logged_gyroY = smooth_gyroY;
         }
         
-        // Запам'ятовуємо попередній стан кнопки
-        prev_left_click_pressed = left_click_pressed;
+        // Додаткове діагностичне логування для EMG (тільки при змінах)
+        if (emg_filter.baseline_initialized) {
+            static int last_logged_diff = 0;
+            int current_diff = filtered_emg_voltage - (int)emg_filter.baseline_voltage;
+            if (abs(current_diff - last_logged_diff) > 20 || emg_state_changed) {
+                ESP_LOGD(TAG, "EMG: Raw=%d, Filtered=%d, Baseline=%.1f, Diff=%d, Active=%s", 
+                         raw_emg_voltage, filtered_emg_voltage, emg_filter.baseline_voltage, 
+                         current_diff, current_emg_active ? "YES" : "NO");
+                last_logged_diff = current_diff;
+            }
+        }
 
         // Затримка циклу (важлива для dt та частоти опитування)
         vTaskDelay(pdMS_TO_TICKS(10)); // 10ms = 100Hz
