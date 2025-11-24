@@ -1,7 +1,13 @@
 /*
- * Об'єднаний код: Bluetooth HID Mouse (MPU6050 + EMG Click)
+ * Об'єднаний код: Bluetooth HID Air Mouse (MPU6050 + EMG Click)
  * Автор злиття: Gemini AI
  * На основі коду: Yaremko Vitaliy
+ * 
+ * AIR MOUSE MODE:
+ * - Використовує гіроскоп для детекції переміщення в просторі
+ * - Рух X контролюється поворотом навколо Y-осі (ліво-право)
+ * - Рух Y контролюється поворотом навколо X-осі (вгору-вниз)
+ * - EMG сигнал використовується для лівої кнопки миші
  */
 
 #include <stdio.h>
@@ -374,10 +380,20 @@ void mouse_logic_task(void *pvParameters)
     float accumulated_x = 0.0;
     float accumulated_y = 0.0;
     
-    // Low-pass filter for angle smoothing
+    // Low-pass filter for angle smoothing (still used for diagnostics)
     float filtered_roll = 0.0;
     float filtered_pitch = 0.0;
     float filter_alpha = 0.7;  // Filter coefficient (0 = no filtering, 1 = max filtering)
+    
+    // Low-pass filter for gyroscope data (for air mouse)
+    float filtered_gyroX = 0.0;
+    float filtered_gyroY = 0.0;
+    float gyro_filter_alpha = 0.8;  // Дуже агресивна фільтрація для усунення ривків
+    
+    // Additional smoothing for very stable movement
+    float smooth_gyroX = 0.0;
+    float smooth_gyroY = 0.0;
+    float smooth_alpha = 0.9;  // Додаткове згладжування
     
     // Movement detection
     uint32_t last_movement_time = 0;
@@ -417,51 +433,56 @@ void mouse_logic_task(void *pvParameters)
         // Застосовуємо фільтр низьких частот для згладжування
         filtered_roll = filter_alpha * filtered_roll + (1.0 - filter_alpha) * roll;
         filtered_pitch = filter_alpha * filtered_pitch + (1.0 - filter_alpha) * pitch;
+        
+        // Багаторівнева фільтрація гіроскопа для air mouse
+        filtered_gyroX = gyro_filter_alpha * filtered_gyroX + (1.0 - gyro_filter_alpha) * gyroX;
+        filtered_gyroY = gyro_filter_alpha * filtered_gyroY + (1.0 - gyro_filter_alpha) * gyroY;
+        
+        // Додаткове згладжування для усунення ривків
+        smooth_gyroX = smooth_alpha * smooth_gyroX + (1.0 - smooth_alpha) * filtered_gyroX;
+        smooth_gyroY = smooth_alpha * smooth_gyroY + (1.0 - smooth_alpha) * filtered_gyroY;
 
-        // 2. Маппінг руху миші (Tilt to Move)
-        // Обчислюємо швидкість руху на основі кута нахилу
+        // 2. Air Mouse - Маппінг руху миші на основі гіроскопа (швидкість обертання)
+        // Використовуємо гіроскоп для детекції переміщення в просторі
         
         float mouse_vel_x = 0.0;
         float mouse_vel_y = 0.0;
 
-        float deadzone = 8.0;      // Збільшена мертва зона в градусах
-        float sensitivity = 0.15;  // Зменшена чутливість для більш точного контролю
-        float max_velocity = 6.0;  // Зменшена максимальна швидкість
+        float gyro_deadzone = 3.0;    // Збільшена мертва зона для стабільності
+        float gyro_sensitivity = 0.8; // Значно зменшена чутливість для плавності
+        float max_velocity = 8.0;     // Зменшена максимальна швидкість
 
-        // Логіка X (Roll) - використовуємо фільтровані значення
-        if (fabs(filtered_roll) > deadzone) {
-            float effective_roll = filtered_roll > 0 ? filtered_roll - deadzone : filtered_roll + deadzone;
-            mouse_vel_x = effective_roll * sensitivity;
+        // Air Mouse логіка X - використовуємо подвійно фільтрований гіроскоп Y
+        if (fabs(smooth_gyroY) > gyro_deadzone) {
+            float effective_gyroY = smooth_gyroY > 0 ? smooth_gyroY - gyro_deadzone : smooth_gyroY + gyro_deadzone;
+            mouse_vel_x = effective_gyroY * gyro_sensitivity;
         } else {
-            mouse_vel_x = 0.0;  // Явно обнулюємо в мертвій зоні
+            mouse_vel_x = 0.0;
         }
 
-        // Логіка Y (Pitch) - використовуємо фільтровані значення
-        if (fabs(filtered_pitch) > deadzone) {
-            float effective_pitch = filtered_pitch > 0 ? filtered_pitch - deadzone : filtered_pitch + deadzone;
-            mouse_vel_y = effective_pitch * sensitivity;
+        // Air Mouse логіка Y - використовуємо подвійно фільтрований гіроскоп X
+        // Інвертуємо для природної поведінки (нахил вперед = рух вгору)
+        if (fabs(smooth_gyroX) > gyro_deadzone) {
+            float effective_gyroX = smooth_gyroX > 0 ? smooth_gyroX - gyro_deadzone : smooth_gyroX + gyro_deadzone;
+            mouse_vel_y = -effective_gyroX * gyro_sensitivity; // Інвертовано
         } else {
-            mouse_vel_y = 0.0;  // Явно обнулюємо в мертвій зоні
+            mouse_vel_y = 0.0;
         }
 
         // Обмежуємо максимальну швидкість
         mouse_vel_x = fmaxf(-max_velocity, fminf(max_velocity, mouse_vel_x));
         mouse_vel_y = fmaxf(-max_velocity, fminf(max_velocity, mouse_vel_y));
         
-        // Накопичуємо рух тільки якщо є значний рух
-        float min_velocity_threshold = 0.2;  // Мінімальний поріг швидкості
-        if (fabs(mouse_vel_x) > min_velocity_threshold || fabs(mouse_vel_y) > min_velocity_threshold) {
-            accumulated_x += mouse_vel_x;
-            accumulated_y += mouse_vel_y;
-        } else {
-            // Поступово зменшуємо накопичений рух при відсутності нового руху
-            accumulated_x *= 0.9;
-            accumulated_y *= 0.9;
-            
-            // Обнулюємо дуже малі значення
-            if (fabs(accumulated_x) < 0.1) accumulated_x = 0.0;
-            if (fabs(accumulated_y) < 0.1) accumulated_y = 0.0;
-        }
+        // Накопичуємо рух з кращим згладжуванням
+        float min_velocity_threshold = 0.1;  // Знижений поріг для кращої відзивчості
+        
+        // Плавне накопичення руху
+        accumulated_x = 0.7 * accumulated_x + 0.3 * mouse_vel_x;
+        accumulated_y = 0.7 * accumulated_y + 0.3 * mouse_vel_y;
+        
+        // Застосовуємо мертву зону до накопичених значень
+        if (fabs(accumulated_x) < min_velocity_threshold) accumulated_x = 0.0;
+        if (fabs(accumulated_y) < min_velocity_threshold) accumulated_y = 0.0;
         
         // Конвертуємо в цілі пікселі для відправки тільки якщо накопичилося достатньо
         int8_t mouse_x = 0, mouse_y = 0;
@@ -515,21 +536,21 @@ void mouse_logic_task(void *pvParameters)
             
             // Логування тільки для значущих подій
             if (movement_detected || button_changed) {
-                ESP_LOGI(TAG, "Mouse Report - X: %d, Y: %d, Buttons: %02X (FRoll: %.1f, FPitch: %.1f)", 
-                         mouse_x, mouse_y, buttons, filtered_roll, filtered_pitch);
+                ESP_LOGI(TAG, "AIR MOUSE - X: %d, Y: %d, Buttons: %02X (SmoothGyroX: %.1f, SmoothGyroY: %.1f)", 
+                         mouse_x, mouse_y, buttons, smooth_gyroX, smooth_gyroY);
             }
         } else if (button_changed && !ble_connected) {
             ESP_LOGW(TAG, "Not connected - Button change detected: %02X", buttons);
         }
         
-        // Діагностика тільки при значних змінах кута (рівень DEBUG)
-        static float last_logged_roll = 0;
-        static float last_logged_pitch = 0;
-        if (fabs(filtered_roll - last_logged_roll) > 10.0 || fabs(filtered_pitch - last_logged_pitch) > 10.0) {
-            ESP_LOGD(TAG, "Angle update - FRoll: %.1f, FPitch: %.1f, VelX: %.2f, VelY: %.2f, AccX: %.2f, AccY: %.2f", 
-                     filtered_roll, filtered_pitch, mouse_vel_x, mouse_vel_y, accumulated_x, accumulated_y);
-            last_logged_roll = filtered_roll;
-            last_logged_pitch = filtered_pitch;
+        // Діагностика тільки при значних змінах гіроскопа (рівень DEBUG)
+        static float last_logged_gyroX = 0;
+        static float last_logged_gyroY = 0;
+        if (fabs(smooth_gyroX - last_logged_gyroX) > 2.0 || fabs(smooth_gyroY - last_logged_gyroY) > 2.0) {
+            ESP_LOGD(TAG, "AIR MOUSE update - SGyroX: %.1f, SGyroY: %.1f, VelX: %.2f, VelY: %.2f, AccX: %.2f, AccY: %.2f", 
+                     smooth_gyroX, smooth_gyroY, mouse_vel_x, mouse_vel_y, accumulated_x, accumulated_y);
+            last_logged_gyroX = smooth_gyroX;
+            last_logged_gyroY = smooth_gyroY;
         }
         
         // Запам'ятовуємо попередній стан кнопки
