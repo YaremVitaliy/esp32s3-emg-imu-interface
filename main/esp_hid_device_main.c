@@ -84,7 +84,7 @@ static const char *TAG = "BLE_MOUSE";
 #define EMG_BASELINE_SAMPLES 120           // Кількість зразків для обчислення базової лінії
 #define EMG_FILTER_SAMPLES 8               // Кількість зразків для ковзного середнього
 #define EMG_NOISE_THRESHOLD_MV 60          // Мінімальна різниця від базової лінії для адаптації
-#define EMG_ACTIVATION_THRESHOLD_MV 30     // Мінімальний поріг активації відносно базової лінії 70
+#define EMG_ACTIVATION_THRESHOLD_MV 50     // Мінімальний поріг активації відносно базової лінії 70
 #define EMG_RELEASE_THRESHOLD_MV 35        // Мінімальний поріг відпускання відносно базової лінії
 #define EMG_MIN_ACTIVATION_TIME_MS 50      // Мінімальний час утримання для валідного кліка
 #define EMG_DEBOUNCE_TIME_MS 150           // Час антидеребезгу між кліками
