@@ -63,8 +63,8 @@
 static const char *TAG = "BLE_MOUSE";
 
 // --- КОНФІГУРАЦІЯ MPU6050 ---
-#define I2C_MASTER_SCL_IO 5 /*!< GPIO number used for I2C master clock */
-#define I2C_MASTER_SDA_IO 4 /*!< GPIO number used for I2C master data  */
+#define I2C_MASTER_SCL_IO 4 /*!< GPIO number used for I2C master clock */
+#define I2C_MASTER_SDA_IO 5 /*!< GPIO number used for I2C master data  */
 #define I2C_MASTER_NUM 0    /*!< I2C master i2c port number */
 #define I2C_MASTER_FREQ_HZ 100000
 #define MPU6050_ADDR 0x68
